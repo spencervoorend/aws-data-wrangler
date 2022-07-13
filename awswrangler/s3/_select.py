@@ -36,19 +36,40 @@ def _gen_scan_range(obj_size: int, scan_range_chunk_size: Optional[int] = None) 
         yield (i, i + min(chunk_size, obj_size - i))
 
 
+def _get_select_object_content_args(
+    paths: Union[str, List[str]],
+    obj_sizes: Dict[str, Optional[int]],
+    args: Dict[str, Any],
+    use_scan_ranges: bool = False,
+    scan_range_chunk_size: Optional[int] = None,
+) -> Tuple[Dict[str, Any], Tuple[int, int]]:
+    # !!!!!!!
+    # This is only a "dirty" example to show how to process all paths + scan ranges concurrently
+    # !!!!!!!
+    for path in paths:
+        obj_size = obj_sizes.get(path)
+        bucket, key = _utils.parse_path(path)
+        if obj_size is None:
+            raise exceptions.InvalidArgumentValue(f"S3 object w/o defined size: {path}")
+        _logger.debug("args:\n%s", pprint.pformat(args))
+        scan_ranges: Iterator[Optional[Tuple[int, int]]] = _gen_scan_range(
+            obj_size=obj_size, scan_range_chunk_size=scan_range_chunk_size
+        ) if use_scan_ranges else [None]
+        args["Bucket"] = bucket
+        args["Key"] = key
+        for scan_range in scan_ranges:
+            if scan_range:
+                args["ScanRange"] = {"Start": scan_range[0], "End": scan_range[1]}
+            yield args
+
+
 @ray_remote
 def _select_object_content(
     boto3_session: Optional[boto3.Session],
     args: Dict[str, Any],
-    scan_range: Optional[Tuple[int, int]] = None,
 ) -> Union[pa.Table, "ray.ObjectRef[pa.Table]"]:
     client_s3: boto3.client = _utils.client(service_name="s3", session=boto3_session)
-
-    if scan_range:
-        _logger.debug("scan_range: %s, key: %s", scan_range, args["Key"])
-        response = client_s3.select_object_content(**args, ScanRange={"Start": scan_range[0], "End": scan_range[1]})
-    else:
-        response = client_s3.select_object_content(**args)
+    response = client_s3.select_object_content(**args)
 
     payload_records = []
     partial_record: str = ""
@@ -72,7 +93,7 @@ def _select_object_content(
 
 
 def _select_query(
-    path: str,
+    paths: Union[str, List[str]],
     executor: Any,
     sql: str,
     input_serialization: str,
@@ -82,11 +103,22 @@ def _select_query(
     boto3_session: Optional[boto3.Session] = None,
     s3_additional_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Union[pa.Table, "ray.ObjectRef[pa.Table]"]]:
-    bucket, key = _utils.parse_path(path)
-
+    use_scan_ranges: bool = True
+    if any(
+        [
+            compression,
+            input_serialization_params.get("AllowQuotedRecordDelimiter"),
+            input_serialization_params.get("Type") == "Document",
+        ]
+    ):  # Scan range is only supported for uncompressed CSV/JSON, CSV (without quoted delimiters)
+        # and JSON objects (in LINES mode only)
+        use_scan_ranges = False
+    obj_sizes: Dict[str, Optional[int]] = size_objects(
+        path=paths,
+        use_threads=False,
+        boto3_session=boto3_session,
+    )
     args: Dict[str, Any] = {
-        "Bucket": bucket,
-        "Key": key,
         "Expression": sql,
         "ExpressionType": "SQL",
         "RequestProgress": {"Enabled": False},
@@ -100,29 +132,17 @@ def _select_query(
     }
     if s3_additional_kwargs:
         args.update(s3_additional_kwargs)
-    _logger.debug("args:\n%s", pprint.pformat(args))
-
-    obj_size: int = size_objects(  # type: ignore
-        path=[path],
-        use_threads=False,
-        boto3_session=boto3_session,
-    ).get(path)
-    if obj_size is None:
-        raise exceptions.InvalidArgumentValue(f"S3 object w/o defined size: {path}")
-    scan_ranges: Iterator[Optional[Tuple[int, int]]] = _gen_scan_range(
-        obj_size=obj_size, scan_range_chunk_size=scan_range_chunk_size
+    args_iterator: Tuple[Dict[str, Any], Tuple[int, int]] = _get_select_object_content_args(
+        paths=paths,
+        obj_sizes=obj_sizes,
+        args=args,
+        use_scan_ranges=use_scan_ranges,
+        scan_range_chunk_size=scan_range_chunk_size,
     )
-    if any(
-        [
-            compression,
-            input_serialization_params.get("AllowQuotedRecordDelimiter"),
-            input_serialization_params.get("Type") == "Document",
-        ]
-    ):  # Scan range is only supported for uncompressed CSV/JSON, CSV (without quoted delimiters)
-        # and JSON objects (in LINES mode only)
-        scan_ranges = [None]  # type: ignore
-
-    return executor.map(_select_object_content, boto3_session, itertools.repeat(args), scan_ranges)  # type: ignore
+    # !!!!!!!
+    # This is only a "dirty" example to show how to process all paths + scan ranges concurrently
+    # !!!!!!!
+    return executor.map(_select_object_content, boto3_session, args_iterator)  # type: ignore
 
 
 def select_query(
@@ -272,5 +292,5 @@ def select_query(
 
     arrow_kwargs = _data_types.pyarrow2pandas_defaults(use_threads=use_threads, kwargs=arrow_additional_kwargs)
     executor = _get_executor(use_threads=use_threads)
-    tables = _flatten_list([_select_query(path=path, executor=executor, **select_kwargs) for path in paths])
+    tables = _select_query(paths=paths, executor=executor, **select_kwargs)
     return _utils.table_refs_to_df(tables=tables, kwargs=arrow_kwargs)
